@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>인터페이스 통합관리</title>
+<style>
+  :root { --bg:#f7f7f8; --fg:#1d1d1f; --muted:#6b6b70; --line:#e2e2e6; --card:#fff;
+          --ok:#1a7f37; --bad:#cf222e; --warn:#9a6700; --accent:#0969da; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#151517; --fg:#ececf0; --muted:#9a9aa2; --line:#2c2c31; --card:#1d1d20;
+            --ok:#3fb950; --bad:#f85149; --warn:#d29922; --accent:#58a6ff; }
+  }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui, sans-serif; }
+  header { padding:16px 20px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; flex:1; }
+  main { padding:16px 20px; max-width:1200px; margin:auto; }
+  h2 { font-size:15px; margin:24px 0 8px; }
+  table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); }
+  th, td { padding:8px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+  th { color:var(--muted); font-weight:500; font-size:12px; }
+  .wrap { overflow-x:auto; }
+  .SUCCESS { color:var(--ok); } .FAILED { color:var(--bad); } .DUPLICATE { color:var(--warn); } .PROCESSING { color:var(--accent); }
+  button, select, input { font:inherit; padding:4px 10px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); }
+  button { cursor:pointer; } button:hover { border-color:var(--accent); }
+  .muted { color:var(--muted); } .err { color:var(--bad); max-width:420px; word-break:break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SAP ↔ 일련번호시스템 인터페이스 통합관리</h1>
+  <input id="key" type="password" placeholder="API 키 (설정된 경우)">
+  <button onclick="refresh()">새로고침</button>
+</header>
+<main>
+  <h2>인터페이스 현황</h2>
+  <div class="wrap"><table id="ifs"><thead><tr>
+    <th>ID</th><th>이름</th><th>방향</th><th>방식</th><th>상태</th><th>성공</th><th>실패</th><th>중복</th><th>최근 실행</th><th>최근 오류</th><th></th>
+  </tr></thead><tbody></tbody></table></div>
+
+  <h2>메시지 로그
+    <select id="status" onchange="loadMessages()">
+      <option value="">전체</option><option>FAILED</option><option>SUCCESS</option><option>DUPLICATE</option>
+    </select>
+  </h2>
+  <div class="wrap"><table id="msgs"><thead><tr>
+    <th>시각</th><th>인터페이스</th><th>상태</th><th>트리거</th><th>시도</th><th>오류</th><th></th>
+  </tr></thead><tbody></tbody></table></div>
+</main>
+<script>
+const keyEl = document.getElementById('key');
+try { keyEl.value = localStorage.getItem('agentKey') || ''; } catch (e) {}
+keyEl.addEventListener('change', () => { try { localStorage.setItem('agentKey', keyEl.value); } catch (e) {} });
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { 'X-API-Key': keyEl.value, 'Content-Type': 'application/json' } });
+  if (!r.ok) throw new Error((await r.text()) || r.status);
+  return r.json();
+}
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]));
+const fmt = t => t ? new Date(t).toLocaleString() : '-';
+
+async function loadStats() {
+  const stats = await api('/api/v1/stats');
+  document.querySelector('#ifs tbody').innerHTML = Object.entries(stats).map(([id, s]) => `
+    <tr><td>${esc(id)}</td><td>${esc(s.name)}</td><td>${s.direction === 'SAP_TO_SERIAL' ? 'SAP → 일련번호' : '일련번호 → SAP'}</td>
+    <td>${esc(s.mode)}</td><td>${s.enabled ? '활성' : '<span class="muted">비활성</span>'}</td>
+    <td class="SUCCESS">${s.counts.SUCCESS || 0}</td><td class="FAILED">${s.counts.FAILED || 0}</td><td class="DUPLICATE">${s.counts.DUPLICATE || 0}</td>
+    <td>${fmt(s.last_run_at)}</td><td class="err">${esc(s.last_error || '')}</td>
+    <td>${s.mode === 'pull' ? `<button onclick="run('${esc(id)}')">실행</button>` : ''}
+        <button onclick="toggle('${esc(id)}', ${s.enabled})">${s.enabled ? '중지' : '활성화'}</button></td></tr>`).join('');
+}
+async function loadMessages() {
+  const st = document.getElementById('status').value;
+  const msgs = await api('/api/v1/messages?limit=200' + (st ? '&status=' + st : ''));
+  document.querySelector('#msgs tbody').innerHTML = msgs.map(m => `
+    <tr><td>${fmt(m.created_at)}</td><td>${esc(m.interface_id)}</td><td class="${m.status}">${m.status}</td>
+    <td>${esc(m.trigger)}</td><td>${m.attempts}</td><td class="err">${esc(m.error || '')}</td>
+    <td>${m.status === 'FAILED' ? `<button onclick="reprocess('${m.id}')">재처리</button>` : ''}</td></tr>`).join('');
+}
+async function run(id) { try { const r = await api(`/api/v1/interfaces/${id}/run`, { method: 'POST' }); alert(`총 ${r.total} / 성공 ${r.success} / 실패 ${r.failed}`); } catch (e) { alert(e.message); } refresh(); }
+async function toggle(id, on) { await api(`/api/v1/interfaces/${id}/${on ? 'disable' : 'enable'}`, { method: 'POST' }); refresh(); }
+async function reprocess(id) { try { await api(`/api/v1/messages/${id}/reprocess`, { method: 'POST' }); } catch (e) { alert(e.message); } refresh(); }
+async function refresh(silent) { try { await Promise.all([loadStats(), loadMessages()]); } catch (e) { if (!silent) alert('조회 실패: ' + e.message); } }
+refresh();
+setInterval(() => refresh(true), 15000);
+</script>
+</body>
+</html>
