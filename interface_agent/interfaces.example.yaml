@@ -1,0 +1,105 @@
+# SAP ↔ 일련번호시스템 인터페이스 정의 (운영 템플릿)
+# 비밀값은 ${ENV_VAR} 로 참조하세요. URL/필드명은 실제 시스템에 맞게 수정이 필요합니다.
+interfaces:
+  # 1) SAP 출하 확정 시 납품서의 일련번호를 일련번호시스템에 등록 (SAP가 에이전트를 호출)
+  - id: SAP_DLV_SERIAL
+    name: 출하 일련번호 전송
+    description: SAP 납품(출고) 확정 → 일련번호시스템 출하 이력 등록
+    direction: SAP_TO_SERIAL
+    mode: push            # SAP(CPI/PI 또는 ABAP HTTP Client)가 POST /api/v1/inbound/SAP_DLV_SERIAL 호출
+    target:
+      system: serial
+      base_url: ${SERIAL_BASE_URL}
+      path: /api/v1/shipments
+      method: POST
+      auth: { type: api_key, header_name: X-API-Key, api_key: "${SERIAL_API_KEY}" }
+    mapping:
+      - { target: delivery_no, source: VBELN, transform: [alpha_out], required: true }
+      - { target: item_no,     source: POSNR, transform: [int] }
+      - { target: material,    source: MATNR, transform: [alpha_out, strip], required: true }
+      - { target: serial_no,   source: SERNR, transform: [strip, upper], required: true }
+      - { target: plant,       source: WERKS }
+      - { target: customer,    source: KUNNR, transform: [alpha_out] }
+      - { target: shipped_on,  source: WADAT_IST, transform: ["date:%Y%m%d>%Y-%m-%d"] }
+      - { target: source_system, constant: SAP }
+    key_fields: [delivery_no, item_no, serial_no]
+    retry: { max_attempts: 5, backoff_seconds: 2, backoff_factor: 2 }
+
+  # 2) SAP 자재마스터 변경분을 주기적으로 조회해 일련번호시스템 품목으로 동기화
+  - id: SAP_MATERIAL_SYNC
+    name: 자재마스터 동기화
+    direction: SAP_TO_SERIAL
+    mode: pull
+    schedule_seconds: 1800
+    source:
+      system: sap
+      base_url: ${SAP_BASE_URL}
+      path: /sap/opu/odata/sap/API_PRODUCT_SRV/A_Product
+      method: GET
+      sap_client: "100"
+      auth: { type: basic, username: "${SAP_USER}", password: "${SAP_PASSWORD}" }
+      params:
+        $format: json
+        $select: Product,ProductType,BaseUnit,SerialNumberProfile,LastChangeDateTime
+        $filter: "LastChangeDateTime gt datetimeoffset'{last_success_sap}Z'"
+    target:
+      system: serial
+      base_url: ${SERIAL_BASE_URL}
+      path: /api/v1/products/bulk
+      method: POST
+      auth: { type: api_key, api_key: "${SERIAL_API_KEY}" }
+    batch: true
+    batch_wrapper: items
+    mapping:
+      - { target: material, source: Product, transform: [alpha_out], required: true }
+      - { target: type,     source: ProductType }
+      - { target: unit,     source: BaseUnit }
+      - { target: serialized, source: SerialNumberProfile, transform: [strip] }
+
+  # 3) 일련번호시스템의 생산완료 일련번호를 SAP 시리얼 마스터/입고에 반영
+  - id: SERIAL_PRODUCED_TO_SAP
+    name: 생산완료 일련번호 SAP 반영
+    direction: SERIAL_TO_SAP
+    mode: pull
+    schedule_seconds: 300
+    source:
+      system: serial
+      base_url: ${SERIAL_BASE_URL}
+      path: /api/v1/serials
+      method: GET
+      auth: { type: api_key, api_key: "${SERIAL_API_KEY}" }
+      params: { status: PRODUCED, since: "{last_success}" }
+      records_path: data
+    target:
+      system: sap
+      base_url: ${SAP_BASE_URL}
+      path: /sap/opu/odata/sap/ZSERIAL_SRV/SerialSet   # 사내 커스텀 OData 서비스 (예시)
+      method: POST
+      sap_client: "100"
+      auth: { type: basic, username: "${SAP_USER}", password: "${SAP_PASSWORD}" }
+    mapping:
+      - { target: Matnr,  source: material, transform: ["alpha_in:18"], required: true }
+      - { target: Sernr,  source: serial_no, transform: [upper], required: true }
+      - { target: Werks,  source: plant }
+      - { target: Aufnr,  source: production_order, transform: ["alpha_in:12"] }
+      - { target: Budat,  source: produced_at, transform: ["date:%Y-%m-%dT%H:%M:%S>%Y%m%d"] }
+    key_fields: [Matnr, Sernr]
+
+  # 4) 일련번호 상태변경(반품/폐기 등)을 일련번호시스템이 에이전트로 푸시 → SAP 반영
+  - id: SERIAL_STATUS_TO_SAP
+    name: 일련번호 상태변경 SAP 반영
+    direction: SERIAL_TO_SAP
+    mode: push
+    target:
+      system: sap
+      base_url: ${SAP_BASE_URL}
+      path: /sap/opu/odata/sap/ZSERIAL_SRV/StatusChangeSet
+      method: POST
+      sap_client: "100"
+      auth: { type: basic, username: "${SAP_USER}", password: "${SAP_PASSWORD}" }
+    mapping:
+      - { target: Sernr,  source: serial_no, transform: [upper], required: true }
+      - { target: Matnr,  source: material, transform: ["alpha_in:18"], required: true }
+      - { target: Status, source: status, transform: ["map:RETURNED=ZRET,SCRAPPED=ZSCR,SHIPPED=ESTO"], required: true }
+      - { target: EventId, source: event_id, required: true }
+    key_fields: [EventId]

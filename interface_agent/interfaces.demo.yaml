@@ -1,0 +1,15 @@
+# 외부 시스템 없이 바로 실행해 볼 수 있는 데모 정의 (mock 커넥터)
+interfaces:
+  - id: DEMO_DLV_SERIAL
+    name: (데모) 출하 일련번호 전송
+    direction: SAP_TO_SERIAL
+    mode: push
+    target: { system: mock, base_url: serial-demo }
+    mapping:
+      - { target: delivery_no, source: VBELN, transform: [alpha_out], required: true }
+      - { target: item_no,     source: POSNR, transform: [int] }
+      - { target: material,    source: MATNR, transform: [alpha_out], required: true }
+      - { target: serial_no,   source: SERNR, transform: [strip, upper], required: true }
+      - { target: shipped_on,  source: WADAT_IST, transform: ["date:%Y%m%d>%Y-%m-%d"] }
+    key_fields: [delivery_no, item_no, serial_no]
+    retry: { max_attempts: 3, backoff_seconds: 0.5 }
